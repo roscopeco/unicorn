@@ -30,31 +30,63 @@ VALUE UcError = Qnil;
 VALUE SavedContext = Qnil;
 VALUE Hook = Qnil;
 
+static size_t uc_rb_engine_memsize(const void *uc_rb) {
+    return sizeof(struct uc_rb_engine);
+}
 
-void Init_unicorn_engine(void) {
-    rb_require("unicorn_engine/unicorn_const");
-    UnicornModule = rb_define_module("UnicornEngine");
-    UcError = rb_define_class_under(UnicornModule, "UcError", rb_eStandardError);
-    SavedContext = rb_define_class_under(UnicornModule, "SavedContext", rb_cObject);
-    Hook = rb_define_class_under(UnicornModule, "Hook", rb_cObject);
-    
-    UcClass = rb_define_class_under(UnicornModule, "Uc", rb_cObject);
-    rb_define_method(UcClass, "initialize", m_uc_initialize, 2);
-    rb_define_method(UcClass, "emu_start", m_uc_emu_start, -1);
-    rb_define_method(UcClass, "emu_stop", m_uc_emu_stop, 0);
-    rb_define_method(UcClass, "reg_read", m_uc_reg_read, 1);
-    rb_define_method(UcClass, "reg_write", m_uc_reg_write, 2);
-    rb_define_method(UcClass, "mem_read", m_uc_mem_read, 2);
-    rb_define_method(UcClass, "mem_write", m_uc_mem_write, 2);
-    rb_define_method(UcClass, "mem_map", m_uc_mem_map, -1);
-    rb_define_method(UcClass, "mem_unmap", m_uc_mem_unmap, 2);
-    rb_define_method(UcClass, "mem_protect", m_uc_mem_protect, 3);
-    rb_define_method(UcClass, "hook_add", m_uc_hook_add, -1);
-    rb_define_method(UcClass, "hook_del", m_uc_hook_del, 1);
-    rb_define_method(UcClass, "query", m_uc_query, 1);
-    rb_define_method(UcClass, "context_save", m_uc_context_save, 0);
-    rb_define_method(UcClass, "context_update", m_uc_context_update, 1);
-    rb_define_method(UcClass, "context_restore", m_uc_context_restore, 1);
+static void uc_rb_engine_free(void *rbdata) {
+    if (rbdata) {
+        const struct uc_rb_engine* ure = (struct uc_rb_engine*)rbdata;
+
+        if (ure->engine) {
+            uc_close(ure->engine);
+        }
+
+        free(rbdata);
+    }
+}
+
+static size_t uc_rb_hook_memsize(const void *uc_rb) {
+    return sizeof(struct uc_rb_hook);
+}
+
+static void uc_rb_hook_mark(void *p){
+    struct uc_rb_hook *hook = p;
+    rb_gc_mark(hook->cb);
+    rb_gc_mark(hook->ud);
+    rb_gc_mark(hook->rUc); // just for completeness sake even though this should already be marked
+}
+
+static void uc_rb_context_free(void *rbdata) {
+    if (rbdata) {
+        uc_context_free(rbdata);
+    }
+}
+
+static const rb_data_type_t uc_rb_engine_type = {
+    "uc_rb_engine",
+    { 0, uc_rb_engine_free, uc_rb_engine_memsize, },
+    0, 0,
+    RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+static const rb_data_type_t uc_rb_hook_type = {
+    "uc_rb_hook",
+    { uc_rb_hook_mark, free, uc_rb_hook_memsize, },
+    0, 0,
+    RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+static const rb_data_type_t uc_rb_saved_context_type = {
+    "uc_rb_saved_context",
+    { 0, uc_rb_context_free, },
+    0, 0,
+    RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+static VALUE uc_rb_alloc(VALUE klass) {
+    struct uc_rb_engine *uc;
+    return TypedData_Make_Struct(klass, struct uc_rb_engine, &uc_rb_engine_type, uc);
 }
 
 VALUE m_uc_initialize(VALUE self, VALUE arch, VALUE mode) {
@@ -65,10 +97,17 @@ VALUE m_uc_initialize(VALUE self, VALUE arch, VALUE mode) {
       rb_raise(UcError, "%s", uc_strerror(err));
     }
 
-    VALUE uc = Data_Wrap_Struct(UcClass, 0, uc_close, _uc);
-    rb_iv_set(self, "@uch", uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    if (!rbdata) {
+
+    }
+
+    rbdata->engine = _uc;
+
     rb_iv_set(self, "@hooks", rb_ary_new());
-    
+
     return self;
 }
 
@@ -79,7 +118,10 @@ VALUE m_uc_emu_start(int argc, VALUE* argv, VALUE self){
     VALUE count;
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
 
     rb_scan_args(argc, argv, "22",&begin, &until, &timeout, &count);
     if (NIL_P(timeout))
@@ -98,7 +140,10 @@ VALUE m_uc_emu_start(int argc, VALUE* argv, VALUE self){
 VALUE m_uc_emu_stop(VALUE self){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
 
     err = uc_emu_stop(_uc);
     if (err != UC_ERR_OK) {
@@ -111,12 +156,14 @@ VALUE m_uc_reg_read(VALUE self, VALUE reg_id){
     uc_err err;
     int32_t tmp_reg = NUM2INT(reg_id);
     int64_t reg_value = 0;
-    VALUE to_ret;
     uc_x86_mmr mmr;
     uc_x86_float80 float80;
 
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
 
     size_t arch_result;
     uc_query(_uc, UC_QUERY_ARCH, &arch_result);
@@ -201,8 +248,11 @@ VALUE m_uc_reg_write(VALUE self, VALUE reg_id, VALUE reg_value){
     uc_x86_float80 float80;
     int64_t tmp;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
-    
+
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+    _uc = rbdata->engine;
+
     size_t arch_result;
     uc_query(_uc, UC_QUERY_ARCH, &arch_result);
     uc_arch arch = (uc_arch) arch_result;
@@ -220,9 +270,11 @@ VALUE m_uc_reg_write(VALUE self, VALUE reg_id, VALUE reg_value){
                 mmr.limit = NUM2UINT(rb_ary_entry(reg_value,2));
                 mmr.flags = NUM2UINT(rb_ary_entry(reg_value,3));
                 err = uc_reg_write(_uc, tmp_reg, &mmr);
+
                 if (err != UC_ERR_OK) {
-                  rb_raise(UcError, "%s", uc_strerror(err));
+                    rb_raise(UcError, "%s", uc_strerror(err));
                 }
+
                 return Qnil;
 
             case UC_X86_REG_FP0:
@@ -241,7 +293,7 @@ VALUE m_uc_reg_write(VALUE self, VALUE reg_id, VALUE reg_value){
                 err = uc_reg_write(_uc, tmp_reg, &float80);
 
                 if (err != UC_ERR_OK) {
-                  rb_raise(UcError, "%s", uc_strerror(err));
+                    rb_raise(UcError, "%s", uc_strerror(err));
                 }
 
                 return Qnil;
@@ -265,7 +317,7 @@ VALUE m_uc_reg_write(VALUE self, VALUE reg_id, VALUE reg_value){
             return Qnil;
         }
     }
-    
+
     tmp = NUM2ULL(reg_value);
     err = uc_reg_write(_uc, NUM2INT(reg_id), &tmp);
     if (err != UC_ERR_OK) {
@@ -279,7 +331,10 @@ VALUE m_uc_mem_read(VALUE self, VALUE address, VALUE size){
     uint8_t bytes[isize];
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
 
     err = uc_mem_read(_uc, NUM2ULL(address), &bytes, isize);
     if (err != UC_ERR_OK) {
@@ -291,7 +346,10 @@ VALUE m_uc_mem_read(VALUE self, VALUE address, VALUE size){
 VALUE m_uc_mem_write(VALUE self, VALUE address, VALUE bytes){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+    _uc = rbdata->engine;
+
     err = uc_mem_write(_uc, NUM2ULL(address), StringValuePtr(bytes), RSTRING_LEN(bytes));
     if (err != UC_ERR_OK) {
       rb_raise(UcError, "%s", uc_strerror(err));
@@ -305,7 +363,10 @@ VALUE m_uc_mem_map(int argc, VALUE* argv, VALUE self){
     VALUE size;
     VALUE perms;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
     rb_scan_args(argc, argv, "21",&address, &size, &perms);
     if (NIL_P(perms))
         perms = INT2NUM(UC_PROT_ALL);
@@ -320,7 +381,11 @@ VALUE m_uc_mem_map(int argc, VALUE* argv, VALUE self){
 VALUE m_uc_mem_unmap(VALUE self, VALUE address, VALUE size){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self, "@uch"), uc_engine, _uc);
+
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+    _uc = rbdata->engine;
+
     err = uc_mem_unmap(_uc, NUM2ULL(address), NUM2ULL(size));
     if (err != UC_ERR_OK) {
       rb_raise(UcError, "%s", uc_strerror(err));
@@ -331,7 +396,10 @@ VALUE m_uc_mem_unmap(VALUE self, VALUE address, VALUE size){
 VALUE m_uc_mem_protect(VALUE self, VALUE address, VALUE size, VALUE perms){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
     err = uc_mem_protect(_uc, NUM2ULL(address), NUM2UINT(size), NUM2ULL(perms));
     if (err != UC_ERR_OK) {
       rb_raise(UcError, "%s", uc_strerror(err));
@@ -340,7 +408,7 @@ VALUE m_uc_mem_protect(VALUE self, VALUE address, VALUE size, VALUE perms){
 }
 
 static void cb_hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data){
-    struct hook *hook = (struct hook *)user_data;
+    struct uc_rb_hook *hook = (struct uc_rb_hook *)user_data;
     VALUE cb;
     VALUE ud;
     VALUE rUc;
@@ -352,7 +420,7 @@ static void cb_hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *u
 }
 
 static void cb_hook_mem_access(uc_engine *uc, uint32_t access, uint64_t address, uint32_t size, int64_t value, void *user_data){
-      struct hook *hook = (struct hook *)user_data;
+      struct uc_rb_hook *hook = (struct uc_rb_hook *)user_data;
     VALUE cb;
     VALUE ud;
     VALUE rUc;
@@ -364,7 +432,7 @@ static void cb_hook_mem_access(uc_engine *uc, uint32_t access, uint64_t address,
 }
 
 static bool cb_hook_mem_invalid(uc_engine *uc, uint32_t access, uint64_t address, uint32_t size, int64_t value, void *user_data){
-    struct hook *hook = (struct hook *)user_data;
+    struct uc_rb_hook *hook = (struct uc_rb_hook *)user_data;
     VALUE cb;
     VALUE ud;
     VALUE rUc;
@@ -372,12 +440,12 @@ static bool cb_hook_mem_invalid(uc_engine *uc, uint32_t access, uint64_t address
     cb = hook->cb;
     ud = hook->ud;
     rUc = hook->rUc;
-    
+
     return RTEST(rb_funcall(cb, rb_intern("call"), 6, rUc, UINT2NUM(access), ULL2NUM(address), UINT2NUM(size), LL2NUM(value), ud));
 }
 
 static uint32_t cb_hook_insn_in(uc_engine *uc, uint32_t port, int size, void *user_data){
-    struct hook *hook = (struct hook *)user_data;
+    struct uc_rb_hook *hook = (struct uc_rb_hook *)user_data;
     VALUE cb;
     VALUE ud;
     VALUE rUc;
@@ -389,7 +457,7 @@ static uint32_t cb_hook_insn_in(uc_engine *uc, uint32_t port, int size, void *us
 }
 
 static void cb_hook_insn_out(uc_engine *uc, uint32_t port, int size, uint32_t value, void *user_data){
-    struct hook *hook = (struct hook *)user_data;
+    struct uc_rb_hook *hook = (struct uc_rb_hook *)user_data;
     VALUE cb;
     VALUE ud;
     VALUE rUc;
@@ -401,7 +469,7 @@ static void cb_hook_insn_out(uc_engine *uc, uint32_t port, int size, uint32_t va
 }
 
 static void cb_hook_insn_syscall(uc_engine *uc, void *user_data){
-    struct hook *hook = (struct hook *)user_data;
+    struct uc_rb_hook *hook = (struct uc_rb_hook *)user_data;
     VALUE cb;
     VALUE ud;
     VALUE rUc;
@@ -413,7 +481,7 @@ static void cb_hook_insn_syscall(uc_engine *uc, void *user_data){
 }
 
 static void cb_hook_intr(uc_engine *uc, uint32_t intno, void *user_data){
-    struct hook *hook = (struct hook *)user_data;
+    struct uc_rb_hook *hook = (struct uc_rb_hook *)user_data;
     VALUE cb;
     VALUE ud;
     VALUE rUc;
@@ -424,13 +492,6 @@ static void cb_hook_intr(uc_engine *uc, uint32_t intno, void *user_data){
     rb_funcall(cb, rb_intern("call"), 3, rUc, ULL2NUM(intno), ud);
 }
 
-static void mark_hook(void *p){
-    struct hook *hook = (struct hook *)p;
-    rb_gc_mark(hook->cb);
-    rb_gc_mark(hook->ud);
-    rb_gc_mark(hook->rUc); // just for completeness sake even though this should already be marked
-}
-
 VALUE m_uc_hook_add(int argc, VALUE* argv, VALUE self){
     VALUE hook_type;
     VALUE callback;
@@ -439,8 +500,11 @@ VALUE m_uc_hook_add(int argc, VALUE* argv, VALUE self){
     VALUE end;
     VALUE arg1;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self, "@uch"), uc_engine, _uc);
-    
+
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+    _uc = rbdata->engine;
+
     rb_scan_args(argc, argv, "24",&hook_type, &callback, &user_data, &begin, &end, &arg1);
     if (NIL_P(begin))
         begin = ULL2NUM(1);
@@ -456,16 +520,20 @@ VALUE m_uc_hook_add(int argc, VALUE* argv, VALUE self){
     if (rb_class_of(callback) != rb_cProc)
         rb_raise(UcError, "Expected Proc callback");
 
-    struct hook *hook = (struct hook *)malloc(sizeof(struct hook));
+    VALUE r_hook;
+    VALUE hooks_list;
+    struct uc_rb_hook *hook;
+
+    r_hook = TypedData_Make_Struct(Hook, struct uc_rb_hook, &uc_rb_hook_type, hook);
+    TypedData_Get_Struct(r_hook, struct uc_rb_hook, &uc_rb_hook_type, hook);
+
     hook->cb = callback;
     hook->ud = user_data;
     hook->rUc = self;
-    VALUE r_hook;
-    VALUE hooks_list;
-    r_hook = Data_Wrap_Struct(Hook, mark_hook, free, hook);
+
     hooks_list = rb_iv_get(self, "@hooks");
     rb_ary_push(hooks_list, r_hook);
-    
+
     uint32_t htype = NUM2UINT(hook_type);
     if(htype == UC_HOOK_INSN){
             switch(NUM2INT(arg1)){
@@ -514,11 +582,14 @@ VALUE m_uc_hook_add(int argc, VALUE* argv, VALUE self){
 VALUE m_uc_hook_del(VALUE self, VALUE hook){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
-    struct hook *h;
-    Data_Get_Struct(hook, struct hook, h);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
+    struct uc_rb_hook *h;
+    TypedData_Get_Struct(hook, struct uc_rb_hook, &uc_rb_hook_type, h);
     err = uc_hook_del(_uc, h->trace);
-    
+
     rb_ary_delete(rb_iv_get(self, "@hooks"), hook);
 
     if (err != UC_ERR_OK) {
@@ -532,7 +603,10 @@ VALUE m_uc_query(VALUE self, VALUE query_mode){
     size_t result;
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
     err = uc_query(_uc, qm, &result);
     if (err != UC_ERR_OK) {
       rb_raise(UcError, "%s", uc_strerror(err));
@@ -543,7 +617,10 @@ VALUE m_uc_query(VALUE self, VALUE query_mode){
 VALUE m_uc_context_save(VALUE self){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
 
     uc_context *_context;
     err = uc_context_alloc(_uc, &_context);
@@ -556,17 +633,20 @@ VALUE m_uc_context_save(VALUE self){
       rb_raise(UcError, "%s", uc_strerror(err));
     }
 
-    VALUE sc = Data_Wrap_Struct(SavedContext, 0, uc_free, _context);
+    VALUE sc = TypedData_Wrap_Struct(SavedContext, &uc_rb_saved_context_type, _context);
     return sc;
 }
 
 VALUE m_uc_context_update(VALUE self, VALUE context){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
 
     uc_context *_context;
-    Data_Get_Struct(context, uc_context, _context);
+    TypedData_Get_Struct(context, uc_context, &uc_rb_saved_context_type, _context);
 
     err = uc_context_save(_uc, _context);
     if (err != UC_ERR_OK) {
@@ -578,14 +658,52 @@ VALUE m_uc_context_update(VALUE self, VALUE context){
 VALUE m_uc_context_restore(VALUE self, VALUE context){
     uc_err err;
     uc_engine *_uc;
-    Data_Get_Struct(rb_iv_get(self,"@uch"), uc_engine, _uc);
+    struct uc_rb_engine *rbdata;
+    TypedData_Get_Struct(self, struct uc_rb_engine, &uc_rb_engine_type, rbdata);
+
+    _uc = rbdata->engine;
 
     uc_context *_context;
-    Data_Get_Struct(context, uc_context, _context);
+    TypedData_Get_Struct(context, uc_context, &uc_rb_saved_context_type, _context);
 
     err = uc_context_restore(_uc, _context);
     if (err != UC_ERR_OK) {
       rb_raise(UcError, "%s", uc_strerror(err));
     }
     return Qnil;
+}
+
+void Init_unicorn_engine(void) {
+    rb_require("unicorn_engine/unicorn_const");
+    UnicornModule = rb_define_module("UnicornEngine");
+
+    UcError = rb_define_class_under(UnicornModule, "UcError", rb_eStandardError);
+
+    SavedContext = rb_define_class_under(UnicornModule, "SavedContext", rb_cObject);
+    rb_undef_alloc_func(SavedContext);
+    rb_undef_method(rb_singleton_class(SavedContext), "new");
+
+    Hook = rb_define_class_under(UnicornModule, "Hook", rb_cObject);
+    rb_undef_alloc_func(Hook);
+    rb_undef_method(rb_singleton_class(Hook), "new");
+
+    UcClass = rb_define_class_under(UnicornModule, "Uc", rb_cObject);
+    rb_define_alloc_func(UcClass, uc_rb_alloc);
+
+    rb_define_method(UcClass, "initialize", m_uc_initialize, 2);
+    rb_define_method(UcClass, "emu_start", m_uc_emu_start, -1);
+    rb_define_method(UcClass, "emu_stop", m_uc_emu_stop, 0);
+    rb_define_method(UcClass, "reg_read", m_uc_reg_read, 1);
+    rb_define_method(UcClass, "reg_write", m_uc_reg_write, 2);
+    rb_define_method(UcClass, "mem_read", m_uc_mem_read, 2);
+    rb_define_method(UcClass, "mem_write", m_uc_mem_write, 2);
+    rb_define_method(UcClass, "mem_map", m_uc_mem_map, -1);
+    rb_define_method(UcClass, "mem_unmap", m_uc_mem_unmap, 2);
+    rb_define_method(UcClass, "mem_protect", m_uc_mem_protect, 3);
+    rb_define_method(UcClass, "hook_add", m_uc_hook_add, -1);
+    rb_define_method(UcClass, "hook_del", m_uc_hook_del, 1);
+    rb_define_method(UcClass, "query", m_uc_query, 1);
+    rb_define_method(UcClass, "context_save", m_uc_context_save, 0);
+    rb_define_method(UcClass, "context_update", m_uc_context_update, 1);
+    rb_define_method(UcClass, "context_restore", m_uc_context_restore, 1);
 }

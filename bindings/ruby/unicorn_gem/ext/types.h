@@ -24,10 +24,13 @@ typedef struct uc_x86_float80 {
     uint16_t exponent;
 } uc_x86_float80;
 
+struct uc_rb_engine {
+    uc_engine *engine;
+};
 
-struct hook {
-  uc_hook trace;
-  VALUE cb;
-  VALUE ud;
-  VALUE rUc;
+struct uc_rb_hook {
+    uc_hook trace;
+    VALUE cb;
+    VALUE ud;
+    VALUE rUc;
 };
